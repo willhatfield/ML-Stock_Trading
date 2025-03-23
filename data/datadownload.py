@@ -1,4 +1,5 @@
 import yfinance as yf
+from datetime import datetime
 #df = yf.download("SPY", start="2018-01-01", end="2024-01-01")
 #df.to_csv("data/SPY_5yr.csv")
 
@@ -6,15 +7,15 @@ import yfinance as yf
 
 
 # Download the data for the NASDAQ index
-df = yf.download("^IXIC", start="2018-01-01", end="2024-01-01")
+df = yf.download("^IXIC", start="2018-01-01", end="2025-01-01")
 df.to_csv("data/NASDAQ_5yr.csv")
 
 # Download the data for the Russell 2000 index
-df = yf.download("^RUT", start="2018-01-01", end="2024-01-01")
+df = yf.download("^RUT", start="2018-01-01", end=datetime.now().strftime("%Y-%m-%d"))
 df.to_csv("data/RUT_5yr.csv")
 
 # Download the data for the Dow Jones index
-df = yf.download("^DJI", start="2018-01-01", end="2024-01-01")
+df = yf.download("^DJI", start="2018-01-01", end="2025-01-01")
 df.to_csv("data/DJI_5yr.csv")
 
 # Download the data for the Nasdaq 100 index
