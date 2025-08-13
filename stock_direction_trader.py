@@ -9,15 +9,19 @@ from datetime import datetime, timedelta
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.model_selection import TimeSeriesSplit
 import joblib
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 tf.random.set_seed(42)
 
-# Import the StockPredictor from beta2.py for data fetching and indicators
+# Import the StockPredictor lazily to avoid heavy dependencies during tests
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
-from beta2 import StockPredictor
+try:  # pragma: no cover - optional dependency
+    from beta2 import StockPredictor
+except Exception:  # When optional dependencies like yfinance are missing
+    StockPredictor = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -46,13 +50,16 @@ class StockDirectionTrader:
         self.balance = initial_balance
         self.position = 0  # Number of shares held
         
-        # For feature extraction and data preparation
-        self.stock_predictor = StockPredictor(
-            prediction_days=lookback_days,
-            feature_days=lookback_days,
-            model_type='lstm',
-            company=symbol
-        )
+        # For feature extraction and data preparation. Import lazily to allow
+        # running unit tests without installing all data dependencies.
+        self.stock_predictor = None
+        if StockPredictor is not None:
+            self.stock_predictor = StockPredictor(
+                prediction_days=lookback_days,
+                feature_days=lookback_days,
+                model_type='lstm',
+                company=symbol,
+            )
         
         # Initialize scalers
         self.feature_scaler = StandardScaler()
@@ -213,48 +220,103 @@ class StockDirectionTrader:
         
         return model
 
-    def train_model(self, X_train, y_train, X_val=None, y_val=None, epochs=50, batch_size=32):
-        """
-        Train the deep learning model.
-        
+    def train_model(
+        self,
+        X_train,
+        y_train,
+        X_val=None,
+        y_val=None,
+        epochs=50,
+        batch_size=32,
+        hyperparameter_grid=None,
+    ):
+        """Train the deep learning model without data leakage.
+
+        The training process explicitly controls the ordering of samples to
+        prevent look-ahead bias. If validation data is not supplied, the last
+        20% of ``X_train``/``y_train`` is used as a chronological validation
+        set. Optionally performs a simple hyperparameter search using
+        ``TimeSeriesSplit``.
+
         Args:
-            X_train: Training features
-            y_train: Training labels
-            X_val: Validation features
-            y_val: Validation labels
+            X_train: Training features including the validation tail
+            y_train: Training labels including the validation tail
+            X_val: Optional explicit validation features
+            y_val: Optional explicit validation labels
             epochs: Number of training epochs
             batch_size: Batch size for training
+            hyperparameter_grid: List of hyperparameter dictionaries for
+                searching. Currently supports ``batch_size``; additional
+                parameters are ignored.
         """
-        # Build the model
-        self.model = self.build_model((X_train.shape[1], X_train.shape[2]))
-        
+
+        # --- Hyperparameter search with TimeSeriesSplit -----------------
+        if hyperparameter_grid:
+            tscv = TimeSeriesSplit(n_splits=max(2, len(hyperparameter_grid)))
+            best_params = None
+            best_score = float("inf")
+
+            for params in hyperparameter_grid:
+                fold_scores = []
+                for train_idx, val_idx in tscv.split(X_train):
+                    model = self.build_model((X_train.shape[1], X_train.shape[2]))
+                    history = model.fit(
+                        X_train[train_idx],
+                        y_train[train_idx],
+                        epochs=1,
+                        batch_size=params.get("batch_size", batch_size),
+                        validation_data=(X_train[val_idx], y_train[val_idx]),
+                        shuffle=False,
+                        verbose=0,
+                    )
+                    fold_scores.append(
+                        min(history.history.get("val_loss", [float("inf")]))
+                    )
+
+                score = np.mean(fold_scores)
+                if score < best_score:
+                    best_score = score
+                    best_params = params
+
+            if best_params:
+                batch_size = best_params.get("batch_size", batch_size)
+
+        # --- Create chronological train/validation split ----------------
+        if X_val is None or y_val is None:
+            split_index = int(len(X_train) * 0.8)
+            self.last_train_indices = np.arange(split_index)
+            self.last_val_indices = np.arange(split_index, len(X_train))
+            X_tr, y_tr = X_train[:split_index], y_train[:split_index]
+            X_val, y_val = X_train[split_index:], y_train[split_index:]
+        else:
+            self.last_train_indices = np.arange(len(X_train))
+            self.last_val_indices = np.arange(len(X_train), len(X_train) + len(X_val))
+            X_tr, y_tr = X_train, y_train
+
+        # Build the model with the final hyperparameters
+        self.model = self.build_model((X_tr.shape[1], X_tr.shape[2]))
+
         # Define callbacks
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5)
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=10, restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.2, patience=5
+            ),
         ]
-        
-        # Train the model
-        if X_val is not None and y_val is not None:
-            history = self.model.fit(
-                X_train, y_train,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=(X_val, y_val),
-                callbacks=callbacks,
-                verbose=1
-            )
-        else:
-            # Use a portion of training data for validation
-            history = self.model.fit(
-                X_train, y_train,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_split=0.2,
-                callbacks=callbacks,
-                verbose=1
-            )
-        
+
+        history = self.model.fit(
+            X_tr,
+            y_tr,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_val, y_val),
+            callbacks=callbacks,
+            shuffle=False,
+            verbose=1,
+        )
+
         return history
 
     def predict_direction(self, features):
