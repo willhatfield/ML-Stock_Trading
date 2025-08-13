@@ -1,22 +1,13 @@
 import numpy as np
 import pandas as pd
-# Matplotlib is only required for plotting, which the tests do not use.
-try:  # pragma: no cover
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError:  # pragma: no cover
-    plt = None
+import matplotlib.pyplot as plt
 import argparse
 import logging
 import os
 import sys
 from datetime import datetime, timedelta
-# TensorFlow is optional for data preparation tests; import lazily.
-try:  # pragma: no cover - heavy dependency not needed for tests
-    import tensorflow as tf
-except ModuleNotFoundError:  # pragma: no cover
-    tf = None
-try:  # pragma: no cover - optional for tests
-    from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import (
         accuracy_score,
         precision_score,
@@ -24,22 +15,21 @@ try:  # pragma: no cover - optional for tests
         f1_score,
         confusion_matrix,
     )
-except ModuleNotFoundError:  # pragma: no cover
-    StandardScaler = None
-    accuracy_score = precision_score = recall_score = f1_score = confusion_matrix = None
-try:  # pragma: no cover
-    import joblib
-except ModuleNotFoundError:  # pragma: no cover
-    joblib = None
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+import joblib
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 if tf is not None:
     tf.random.set_seed(42)
 
-# Import the StockPredictor from beta2.py for data fetching and indicators
+# Import the StockPredictor lazily to avoid heavy dependencies during tests
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
-from beta2 import StockPredictor
+try:  # pragma: no cover - optional dependency
+    from beta2 import StockPredictor
+except Exception:  # When optional dependencies like yfinance are missing
+    StockPredictor = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -51,7 +41,7 @@ class StockDirectionTrader:
     and simulates trading based on those predictions.
     """
     
-    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100):
+    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100, transaction_cost=0.0):
         """
         Initialize the trader with the given parameters.
         
@@ -67,14 +57,18 @@ class StockDirectionTrader:
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.position = 0  # Number of shares held
+        self.transaction_cost = transaction_cost  # Proportional transaction cost
         
-        # For feature extraction and data preparation
-        self.stock_predictor = StockPredictor(
-            prediction_days=lookback_days,
-            feature_days=lookback_days,
-            model_type='lstm',
-            company=symbol
-        )
+        # For feature extraction and data preparation. Import lazily to allow
+        # running unit tests without installing all data dependencies.
+        self.stock_predictor = None
+        if StockPredictor is not None:
+            self.stock_predictor = StockPredictor(
+                prediction_days=lookback_days,
+                feature_days=lookback_days,
+                model_type='lstm',
+                company=symbol,
+            )
         
         # Initialize scalers
         self.feature_scaler = StandardScaler() if StandardScaler else None
@@ -199,48 +193,103 @@ class StockDirectionTrader:
         
         return model
 
-    def train_model(self, X_train, y_train, X_val=None, y_val=None, epochs=50, batch_size=32):
-        """
-        Train the deep learning model.
-        
+    def train_model(
+        self,
+        X_train,
+        y_train,
+        X_val=None,
+        y_val=None,
+        epochs=50,
+        batch_size=32,
+        hyperparameter_grid=None,
+    ):
+        """Train the deep learning model without data leakage.
+
+        The training process explicitly controls the ordering of samples to
+        prevent look-ahead bias. If validation data is not supplied, the last
+        20% of ``X_train``/``y_train`` is used as a chronological validation
+        set. Optionally performs a simple hyperparameter search using
+        ``TimeSeriesSplit``.
+
         Args:
-            X_train: Training features
-            y_train: Training labels
-            X_val: Validation features
-            y_val: Validation labels
+            X_train: Training features including the validation tail
+            y_train: Training labels including the validation tail
+            X_val: Optional explicit validation features
+            y_val: Optional explicit validation labels
             epochs: Number of training epochs
             batch_size: Batch size for training
+            hyperparameter_grid: List of hyperparameter dictionaries for
+                searching. Currently supports ``batch_size``; additional
+                parameters are ignored.
         """
-        # Build the model
-        self.model = self.build_model((X_train.shape[1], X_train.shape[2]))
-        
+
+        # --- Hyperparameter search with TimeSeriesSplit -----------------
+        if hyperparameter_grid:
+            tscv = TimeSeriesSplit(n_splits=max(2, len(hyperparameter_grid)))
+            best_params = None
+            best_score = float("inf")
+
+            for params in hyperparameter_grid:
+                fold_scores = []
+                for train_idx, val_idx in tscv.split(X_train):
+                    model = self.build_model((X_train.shape[1], X_train.shape[2]))
+                    history = model.fit(
+                        X_train[train_idx],
+                        y_train[train_idx],
+                        epochs=1,
+                        batch_size=params.get("batch_size", batch_size),
+                        validation_data=(X_train[val_idx], y_train[val_idx]),
+                        shuffle=False,
+                        verbose=0,
+                    )
+                    fold_scores.append(
+                        min(history.history.get("val_loss", [float("inf")]))
+                    )
+
+                score = np.mean(fold_scores)
+                if score < best_score:
+                    best_score = score
+                    best_params = params
+
+            if best_params:
+                batch_size = best_params.get("batch_size", batch_size)
+
+        # --- Create chronological train/validation split ----------------
+        if X_val is None or y_val is None:
+            split_index = int(len(X_train) * 0.8)
+            self.last_train_indices = np.arange(split_index)
+            self.last_val_indices = np.arange(split_index, len(X_train))
+            X_tr, y_tr = X_train[:split_index], y_train[:split_index]
+            X_val, y_val = X_train[split_index:], y_train[split_index:]
+        else:
+            self.last_train_indices = np.arange(len(X_train))
+            self.last_val_indices = np.arange(len(X_train), len(X_train) + len(X_val))
+            X_tr, y_tr = X_train, y_train
+
+        # Build the model with the final hyperparameters
+        self.model = self.build_model((X_tr.shape[1], X_tr.shape[2]))
+
         # Define callbacks
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5)
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=10, restore_best_weights=True
+            ),
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss", factor=0.2, patience=5
+            ),
         ]
-        
-        # Train the model
-        if X_val is not None and y_val is not None:
-            history = self.model.fit(
-                X_train, y_train,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=(X_val, y_val),
-                callbacks=callbacks,
-                verbose=1
-            )
-        else:
-            # Use a portion of training data for validation
-            history = self.model.fit(
-                X_train, y_train,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_split=0.2,
-                callbacks=callbacks,
-                verbose=1
-            )
-        
+
+        history = self.model.fit(
+            X_tr,
+            y_tr,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_val, y_val),
+            callbacks=callbacks,
+            shuffle=False,
+            verbose=1,
+        )
+
         return history
 
     def predict_direction(self, features):
@@ -260,28 +309,18 @@ class StockDirectionTrader:
         if len(features.shape) == 2:
             features = np.expand_dims(features, axis=0)
         
-        # Get prediction probability
+        # Get prediction probability and use it directly without random noise
         pred_prob = self.model.predict(features, verbose=0)
-        raw_confidence = pred_prob[0][0]
-        
-        # Add randomness to predictions to avoid always predicting the same direction
-        # Use a lower threshold for UP predictions to encourage more diversity
-        # This is a form of exploration in reinforcement learning
-        
-        # Add noise to the prediction probability
-        noise_factor = 0.05  # 5% noise
-        noisy_confidence = raw_confidence + np.random.uniform(-noise_factor, noise_factor)
-        
-        # Ensure it's still a valid probability
-        noisy_confidence = max(0.01, min(0.99, noisy_confidence))
-        
-        # Use a threshold of 0.48 to encourage more DOWN predictions
-        prediction = 1 if noisy_confidence > 0.51 else 0
-        
-        # Log the original and adjusted confidence
-        logger.debug(f"Raw confidence: {raw_confidence:.4f}, Noisy confidence: {noisy_confidence:.4f}, Prediction: {prediction}")
-        
-        return prediction, noisy_confidence
+        confidence = float(pred_prob[0][0])
+
+        # Determine signal based on raw model confidence
+        signal = int(confidence > 0.5)
+
+        logger.debug(
+            f"Confidence: {confidence:.4f}, Prediction: {signal}"
+        )
+
+        return signal, confidence
 
     def generate_signal(self, prediction, confidence, current_position):
         """
@@ -322,71 +361,75 @@ class StockDirectionTrader:
                 logger.debug("Holding: General case")
             return 'HOLD'
 
-    def execute_trade(self, signal, current_price, date):
+    def execute_trade(self, signal, execution_price, date):
         """
         Execute a trade based on the signal.
         
         Args:
             signal: Trading signal ('BUY', 'SELL', or 'HOLD')
-            current_price: Current stock price
-            date: Date of the trade
+            execution_price: Price at which the trade is executed
+            date: Execution date
             
         Returns:
             Updated balance and position
         """
-        # Simplified trading logic (no commissions, slippage, etc.)
+        # Simplified trading logic with proportional transaction costs
         if signal == 'BUY' and self.position == 0:
-            # Calculate number of shares to buy (using all available balance)
-            shares_to_buy = self.balance / current_price
-            self.position = shares_to_buy
+            # Calculate number of shares to buy accounting for transaction cost
+            shares_to_buy = self.balance / (execution_price * (1 + self.transaction_cost))
+            cost = shares_to_buy * execution_price
+            fee = cost * self.transaction_cost
             previous_balance = self.balance
-            self.balance = 0  # All cash used to buy shares
-            
+            self.position = shares_to_buy
+            self.balance -= cost + fee
+
             # Log the trade
             self.trade_log.append({
                 'date': date,
                 'action': 'BUY',
-                'price': current_price,
+                'price': execution_price,
                 'shares': shares_to_buy,
                 'previous_balance': previous_balance,
                 'new_balance': self.balance,
-                'portfolio_value': self.position * current_price
+                'portfolio_value': self.position * execution_price,
+                'transaction_cost': fee
             })
-            
+
             self.metrics['total_trades'] += 1
-            
+
         elif signal == 'SELL' and self.position > 0:
             # Calculate proceeds from selling all shares
-            proceeds = self.position * current_price
+            proceeds = self.position * execution_price
+            fee = proceeds * self.transaction_cost
             previous_balance = self.balance
-            portfolio_value_before = self.position * current_price
-            self.balance = proceeds
-            
+            self.balance += proceeds - fee
+
             # Determine if this was a winning trade
             last_buy_price = None
             for trade in reversed(self.trade_log):
                 if trade['action'] == 'BUY':
                     last_buy_price = trade['price']
                     break
-            
+
             if last_buy_price is not None:
-                trade_profit = (current_price - last_buy_price) * self.position
+                trade_profit = (execution_price - last_buy_price) * self.position
                 if trade_profit > 0:
                     self.metrics['winning_trades'] += 1
                 else:
                     self.metrics['losing_trades'] += 1
-            
+
             # Log the trade
             self.trade_log.append({
                 'date': date,
                 'action': 'SELL',
-                'price': current_price,
+                'price': execution_price,
                 'shares': self.position,
                 'previous_balance': previous_balance,
                 'new_balance': self.balance,
-                'portfolio_value': 0
+                'portfolio_value': 0,
+                'transaction_cost': fee
             })
-            
+
             self.position = 0
             self.metrics['total_trades'] += 1
         
@@ -434,9 +477,11 @@ class StockDirectionTrader:
         logger.info("Starting backtesting...")
         
         # Iterate through each day
-        for i in range(start_idx, end_idx):
+        for i in range(start_idx, end_idx - 1):
             current_date = df.index[i]
             current_price = df['Close'].iloc[i]
+            next_date = df.index[i + 1]
+            next_price = df['Close'].iloc[i + 1]
             
             # Extract features for the lookback period
             feature_columns = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -454,23 +499,22 @@ class StockDirectionTrader:
             logger.debug(f"  Prediction: {'UP' if prediction == 1 else 'DOWN'}, Confidence: {confidence:.4f}")
             
             # Record the actual price movement for performance evaluation
-            if i+1 < len(df):
-                actual_movement = 1 if df['Close'].iloc[i+1] > current_price else 0
-                actual_movements.append(actual_movement)
-                # Store prediction for later evaluation
-                predictions.append(prediction)
-                logger.debug(f"  Actual movement: {'UP' if actual_movement == 1 else 'DOWN'}")
+            actual_movement = 1 if next_price > current_price else 0
+            actual_movements.append(actual_movement)
+            # Store prediction for later evaluation
+            predictions.append(prediction)
+            logger.debug(f"  Actual movement: {'UP' if actual_movement == 1 else 'DOWN'}")
             
             # Generate trading signal
             signal = self.generate_signal(prediction, confidence, self.position)
             
-            # Execute trade
-            self.execute_trade(signal, current_price, current_date)
-            
-            # Calculate and record portfolio value
-            portfolio_value = self.calculate_portfolio_value(current_price)
+            # Execute trade on next bar
+            self.execute_trade(signal, next_price, next_date)
+
+            # Calculate and record portfolio value using execution price
+            portfolio_value = self.calculate_portfolio_value(next_price)
             portfolio_values.append(portfolio_value)
-            dates.append(current_date)
+            dates.append(next_date)
             
             # Update max drawdown
             highest_value = max(highest_value, portfolio_value)
@@ -479,8 +523,11 @@ class StockDirectionTrader:
             
             # Logging for all significant signals
             if signal != 'HOLD':
-                logger.info(f"Date: {current_date}, Price: ${current_price:.2f}, Prediction: {'UP' if prediction == 1 else 'DOWN'} (conf: {confidence:.4f}), "
-                           f"Signal: {signal}, Portfolio Value: ${portfolio_value:.2f}")
+                logger.info(
+                    f"Date: {next_date}, Price: ${next_price:.2f}, "
+                    f"Prediction: {'UP' if prediction == 1 else 'DOWN'} (conf: {confidence:.4f}), "
+                    f"Signal: {signal}, Portfolio Value: ${portfolio_value:.2f}"
+                )
         
         # Calculate accuracy metrics
         if len(predictions) > 0 and len(actual_movements) > 0:
