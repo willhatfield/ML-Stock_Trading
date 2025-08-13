@@ -6,18 +6,25 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-import tensorflow as tf
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 import joblib
 
-# Set random seeds for reproducibility
+try:
+    import tensorflow as tf
+    tf.random.set_seed(42)
+except Exception:  # pragma: no cover - TensorFlow optional for tests
+    tf = None
+
+# Set random seed for reproducibility
 np.random.seed(42)
-tf.random.set_seed(42)
 
 # Import the StockPredictor from beta2.py for data fetching and indicators
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
-from beta2 import StockPredictor
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
+    from beta2 import StockPredictor
+except Exception:  # pragma: no cover - optional during tests
+    StockPredictor = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -29,7 +36,7 @@ class StockDirectionTrader:
     and simulates trading based on those predictions.
     """
     
-    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100):
+    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100, max_position=1.0):
         """
         Initialize the trader with the given parameters.
         
@@ -45,14 +52,18 @@ class StockDirectionTrader:
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.position = 0  # Number of shares held
+        # Maximum fraction of equity allowed in a single position
+        self.max_position = max_position
         
         # For feature extraction and data preparation
-        self.stock_predictor = StockPredictor(
-            prediction_days=lookback_days,
-            feature_days=lookback_days,
-            model_type='lstm',
-            company=symbol
-        )
+        self.stock_predictor = None
+        if StockPredictor is not None:
+            self.stock_predictor = StockPredictor(
+                prediction_days=lookback_days,
+                feature_days=lookback_days,
+                model_type='lstm',
+                company=symbol
+            )
         
         # Initialize scalers
         self.feature_scaler = StandardScaler()
@@ -75,7 +86,13 @@ class StockDirectionTrader:
             'accuracy': 0.0,
             'precision': 0.0,
             'recall': 0.0,
-            'f1_score': 0.0
+            'f1_score': 0.0,
+            # Risk metrics
+            'Sharpe': 0.0,
+            'Sortino': 0.0,
+            'MDD': 0.0,
+            'Turnover': 0.0,
+            'Exposure': 0.0,
         }
 
     def prepare_data(self, start_date, end_date):
@@ -195,6 +212,9 @@ class StockDirectionTrader:
         Returns:
             Compiled TensorFlow model
         """
+        if tf is None:  # pragma: no cover - avoids heavy dependency in tests
+            raise ImportError("TensorFlow is required to build the model")
+
         model = tf.keras.Sequential([
             tf.keras.layers.LSTM(64, input_shape=input_shape, return_sequences=True),
             tf.keras.layers.Dropout(0.2),
@@ -203,14 +223,14 @@ class StockDirectionTrader:
             tf.keras.layers.Dense(16, activation='relu'),
             tf.keras.layers.Dense(1, activation='sigmoid')
         ])
-        
+
         # Use binary crossentropy for binary classification
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
             loss='binary_crossentropy',
             metrics=['accuracy']
         )
-        
+
         return model
 
     def train_model(self, X_train, y_train, X_val=None, y_val=None, epochs=50, batch_size=32):
@@ -225,6 +245,9 @@ class StockDirectionTrader:
             epochs: Number of training epochs
             batch_size: Batch size for training
         """
+        if tf is None:  # pragma: no cover - avoids heavy dependency in tests
+            raise ImportError("TensorFlow is required to train the model")
+
         # Build the model
         self.model = self.build_model((X_train.shape[1], X_train.shape[2]))
         
@@ -349,30 +372,41 @@ class StockDirectionTrader:
             Updated balance and position
         """
         # Simplified trading logic (no commissions, slippage, etc.)
-        if signal == 'BUY' and self.position == 0:
-            # Calculate number of shares to buy (using all available balance)
-            shares_to_buy = self.balance / current_price
-            self.position = shares_to_buy
-            previous_balance = self.balance
-            self.balance = 0  # All cash used to buy shares
-            
-            # Log the trade
-            self.trade_log.append({
-                'date': date,
-                'action': 'BUY',
-                'price': current_price,
-                'shares': shares_to_buy,
-                'previous_balance': previous_balance,
-                'new_balance': self.balance,
-                'portfolio_value': self.position * current_price
-            })
-            
-            self.metrics['total_trades'] += 1
-            
+        equity = self.balance + self.position * current_price
+
+        if signal == 'BUY':
+            # Determine target position based on max_position cap
+            max_position_value = self.max_position * equity
+            current_position_value = self.position * current_price
+            allowable_value = max_position_value - current_position_value
+
+            if allowable_value > 0 and self.balance > 0:
+                shares_to_buy = min(allowable_value / current_price, self.balance / current_price)
+                if shares_to_buy > 0:
+                    previous_balance = self.balance
+                    previous_position = self.position
+                    self.position += shares_to_buy
+                    self.balance -= shares_to_buy * current_price
+
+                    # Log the trade
+                    self.trade_log.append({
+                        'date': date,
+                        'action': 'BUY',
+                        'price': current_price,
+                        'shares': shares_to_buy,
+                        'previous_balance': previous_balance,
+                        'previous_position': previous_position,
+                        'new_balance': self.balance,
+                        'portfolio_value': self.position * current_price
+                    })
+
+                    self.metrics['total_trades'] += 1
+
         elif signal == 'SELL' and self.position > 0:
             # Calculate proceeds from selling all shares
             proceeds = self.position * current_price
             previous_balance = self.balance
+            previous_position = self.position
             portfolio_value_before = self.position * current_price
             self.balance = proceeds
             
@@ -397,10 +431,11 @@ class StockDirectionTrader:
                 'price': current_price,
                 'shares': self.position,
                 'previous_balance': previous_balance,
+                'previous_position': previous_position,
                 'new_balance': self.balance,
                 'portfolio_value': 0
             })
-            
+
             self.position = 0
             self.metrics['total_trades'] += 1
         
@@ -440,10 +475,13 @@ class StockDirectionTrader:
         dates = []
         predictions = []
         actual_movements = []
-        
+
         # Keep track of the highest portfolio value seen
         highest_value = self.initial_balance
         max_drawdown = 0
+
+        # Track exposure (days invested)
+        exposure_days = 0
         
         logger.info("Starting backtesting...")
         
@@ -480,11 +518,15 @@ class StockDirectionTrader:
             
             # Execute trade
             self.execute_trade(signal, current_price, current_date)
-            
+
             # Calculate and record portfolio value
             portfolio_value = self.calculate_portfolio_value(current_price)
             portfolio_values.append(portfolio_value)
             dates.append(current_date)
+
+            # Track exposure
+            if self.position > 0:
+                exposure_days += 1
             
             # Update max drawdown
             highest_value = max(highest_value, portfolio_value)
@@ -517,12 +559,31 @@ class StockDirectionTrader:
             self.metrics['recall'] = recall
             self.metrics['f1_score'] = f1
         
+        # Calculate risk metrics
+        returns = pd.Series(portfolio_values).pct_change().dropna()
+        if not returns.empty:
+            sharpe = np.sqrt(252) * returns.mean() / returns.std() if returns.std() != 0 else 0.0
+            downside = returns[returns < 0]
+            sortino = np.sqrt(252) * returns.mean() / downside.std() if downside.std() != 0 else 0.0
+        else:
+            sharpe = 0.0
+            sortino = 0.0
+
+        total_traded = sum(abs(t['shares']) * t['price'] for t in self.trade_log)
+        turnover = total_traded / self.initial_balance if self.initial_balance > 0 else 0.0
+        exposure = exposure_days / len(portfolio_values) if portfolio_values else 0.0
+
         # Update final metrics
         final_value = portfolio_values[-1] if portfolio_values else self.initial_balance
         self.metrics['final_balance'] = final_value
         self.metrics['total_profit'] = final_value - self.initial_balance
         self.metrics['max_drawdown'] = max_drawdown
-        
+        self.metrics['MDD'] = max_drawdown
+        self.metrics['Sharpe'] = sharpe
+        self.metrics['Sortino'] = sortino
+        self.metrics['Turnover'] = turnover
+        self.metrics['Exposure'] = exposure
+
         if self.metrics['total_trades'] > 0:
             self.metrics['win_rate'] = self.metrics['winning_trades'] / self.metrics['total_trades']
         
