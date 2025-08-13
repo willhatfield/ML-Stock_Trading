@@ -29,7 +29,7 @@ class StockDirectionTrader:
     and simulates trading based on those predictions.
     """
     
-    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100):
+    def __init__(self, symbol, lookback_days=30, test_size=0.2, initial_balance=100, transaction_cost=0.0):
         """
         Initialize the trader with the given parameters.
         
@@ -45,6 +45,7 @@ class StockDirectionTrader:
         self.initial_balance = initial_balance
         self.balance = initial_balance
         self.position = 0  # Number of shares held
+        self.transaction_cost = transaction_cost  # Proportional transaction cost
         
         # For feature extraction and data preparation
         self.stock_predictor = StockPredictor(
@@ -336,71 +337,75 @@ class StockDirectionTrader:
                 logger.debug("Holding: General case")
             return 'HOLD'
 
-    def execute_trade(self, signal, current_price, date):
+    def execute_trade(self, signal, execution_price, date):
         """
         Execute a trade based on the signal.
         
         Args:
             signal: Trading signal ('BUY', 'SELL', or 'HOLD')
-            current_price: Current stock price
-            date: Date of the trade
+            execution_price: Price at which the trade is executed
+            date: Execution date
             
         Returns:
             Updated balance and position
         """
-        # Simplified trading logic (no commissions, slippage, etc.)
+        # Simplified trading logic with proportional transaction costs
         if signal == 'BUY' and self.position == 0:
-            # Calculate number of shares to buy (using all available balance)
-            shares_to_buy = self.balance / current_price
-            self.position = shares_to_buy
+            # Calculate number of shares to buy accounting for transaction cost
+            shares_to_buy = self.balance / (execution_price * (1 + self.transaction_cost))
+            cost = shares_to_buy * execution_price
+            fee = cost * self.transaction_cost
             previous_balance = self.balance
-            self.balance = 0  # All cash used to buy shares
-            
+            self.position = shares_to_buy
+            self.balance -= cost + fee
+
             # Log the trade
             self.trade_log.append({
                 'date': date,
                 'action': 'BUY',
-                'price': current_price,
+                'price': execution_price,
                 'shares': shares_to_buy,
                 'previous_balance': previous_balance,
                 'new_balance': self.balance,
-                'portfolio_value': self.position * current_price
+                'portfolio_value': self.position * execution_price,
+                'transaction_cost': fee
             })
-            
+
             self.metrics['total_trades'] += 1
-            
+
         elif signal == 'SELL' and self.position > 0:
             # Calculate proceeds from selling all shares
-            proceeds = self.position * current_price
+            proceeds = self.position * execution_price
+            fee = proceeds * self.transaction_cost
             previous_balance = self.balance
-            portfolio_value_before = self.position * current_price
-            self.balance = proceeds
-            
+            self.balance += proceeds - fee
+
             # Determine if this was a winning trade
             last_buy_price = None
             for trade in reversed(self.trade_log):
                 if trade['action'] == 'BUY':
                     last_buy_price = trade['price']
                     break
-            
+
             if last_buy_price is not None:
-                trade_profit = (current_price - last_buy_price) * self.position
+                trade_profit = (execution_price - last_buy_price) * self.position
                 if trade_profit > 0:
                     self.metrics['winning_trades'] += 1
                 else:
                     self.metrics['losing_trades'] += 1
-            
+
             # Log the trade
             self.trade_log.append({
                 'date': date,
                 'action': 'SELL',
-                'price': current_price,
+                'price': execution_price,
                 'shares': self.position,
                 'previous_balance': previous_balance,
                 'new_balance': self.balance,
-                'portfolio_value': 0
+                'portfolio_value': 0,
+                'transaction_cost': fee
             })
-            
+
             self.position = 0
             self.metrics['total_trades'] += 1
         
@@ -448,9 +453,11 @@ class StockDirectionTrader:
         logger.info("Starting backtesting...")
         
         # Iterate through each day
-        for i in range(start_idx, end_idx):
+        for i in range(start_idx, end_idx - 1):
             current_date = df.index[i]
             current_price = df['Close'].iloc[i]
+            next_date = df.index[i + 1]
+            next_price = df['Close'].iloc[i + 1]
             
             # Extract features for the lookback period
             feature_columns = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -468,23 +475,22 @@ class StockDirectionTrader:
             logger.debug(f"  Prediction: {'UP' if prediction == 1 else 'DOWN'}, Confidence: {confidence:.4f}")
             
             # Record the actual price movement for performance evaluation
-            if i+1 < len(df):
-                actual_movement = 1 if df['Close'].iloc[i+1] > current_price else 0
-                actual_movements.append(actual_movement)
-                # Store prediction for later evaluation
-                predictions.append(prediction)
-                logger.debug(f"  Actual movement: {'UP' if actual_movement == 1 else 'DOWN'}")
+            actual_movement = 1 if next_price > current_price else 0
+            actual_movements.append(actual_movement)
+            # Store prediction for later evaluation
+            predictions.append(prediction)
+            logger.debug(f"  Actual movement: {'UP' if actual_movement == 1 else 'DOWN'}")
             
             # Generate trading signal
             signal = self.generate_signal(prediction, confidence, self.position)
             
-            # Execute trade
-            self.execute_trade(signal, current_price, current_date)
-            
-            # Calculate and record portfolio value
-            portfolio_value = self.calculate_portfolio_value(current_price)
+            # Execute trade on next bar
+            self.execute_trade(signal, next_price, next_date)
+
+            # Calculate and record portfolio value using execution price
+            portfolio_value = self.calculate_portfolio_value(next_price)
             portfolio_values.append(portfolio_value)
-            dates.append(current_date)
+            dates.append(next_date)
             
             # Update max drawdown
             highest_value = max(highest_value, portfolio_value)
@@ -493,8 +499,11 @@ class StockDirectionTrader:
             
             # Logging for all significant signals
             if signal != 'HOLD':
-                logger.info(f"Date: {current_date}, Price: ${current_price:.2f}, Prediction: {'UP' if prediction == 1 else 'DOWN'} (conf: {confidence:.4f}), "
-                           f"Signal: {signal}, Portfolio Value: ${portfolio_value:.2f}")
+                logger.info(
+                    f"Date: {next_date}, Price: ${next_price:.2f}, "
+                    f"Prediction: {'UP' if prediction == 1 else 'DOWN'} (conf: {confidence:.4f}), "
+                    f"Signal: {signal}, Portfolio Value: ${portfolio_value:.2f}"
+                )
         
         # Calculate accuracy metrics
         if len(predictions) > 0 and len(actual_movements) > 0:
