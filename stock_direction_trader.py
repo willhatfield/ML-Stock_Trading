@@ -6,14 +6,33 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import joblib
+import yfinance as yf
+try:
+    import tensorflow as tf
+except ImportError:  # pragma: no cover - fallback when TF isn't installed
+    tf = None
+
+try:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score,
+        confusion_matrix,
+    )
+except ImportError:  # pragma: no cover
+    StandardScaler = None
+    accuracy_score = precision_score = recall_score = f1_score = confusion_matrix = None
+try:
+    import joblib
+except ImportError:  # pragma: no cover
+    joblib = None
 
 # Set random seeds for reproducibility
 np.random.seed(42)
-tf.random.set_seed(42)
+if tf is not None:
+    tf.random.set_seed(42)
 
 # Import the StockPredictor from beta2.py for data fetching and indicators
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
@@ -55,7 +74,7 @@ class StockDirectionTrader:
         )
         
         # Initialize scalers
-        self.feature_scaler = StandardScaler()
+        self.feature_scaler = StandardScaler() if StandardScaler is not None else None
         
         # Initialize model
         self.model = None
@@ -89,56 +108,38 @@ class StockDirectionTrader:
         Returns:
             DataFrame with price data and features
         """
-        # Fetch historical data
+        # Fetch historical data with actual trading days from yfinance
         logger.info(f"Fetching data for {self.symbol} from {start_date} to {end_date}")
-        price_data, feature_data = self.stock_predictor.fetch_data(start_date, end_date, self.symbol)
-        
-        if len(price_data) == 0:
+        price_df = yf.download(self.symbol, start=start_date, end=end_date, progress=False)
+
+        if price_df.empty:
             raise ValueError(f"No data retrieved for {self.symbol}. Check the symbol and date range.")
-        
-        # Handle different shapes of price_data
-        logger.info(f"Price data shape: {price_data.shape}")
-        
-        # Ensure price_data is 1-dimensional
-        if len(price_data.shape) > 1:
-            # If it's a 2D array, assume the first column is the close price
-            price_values = price_data[:, 0] if price_data.shape[1] > 0 else price_data.flatten()
-        else:
-            price_values = price_data
-        
-        # Create a DataFrame with dates as index
-        dates = pd.date_range(start=start_date, periods=len(price_values), freq='B')
-        
-        # Create a DataFrame with the Close prices
-        df = pd.DataFrame({
-            'Close': price_values
-        }, index=dates)
-        
-        # Generate simple OHLC data (approximation since we only have Close)
-        # This is just for features that might expect this format
-        df['Open'] = df['Close'].values
-        df['High'] = df['Close'].values
-        df['Low'] = df['Close'].values
-        df['Volume'] = 0  # Placeholder
-        
-        # Add technical indicators from feature_data
-        if feature_data is not None and feature_data.size > 0:
-            logger.info(f"Feature data shape: {feature_data.shape}")
-            
-            # Get feature names based on beta2.py structure
-            feature_names = [
-                'Volume', 'Returns', 'MA5', 'MA20', 'RSI', 'MACD', 
-                'BBWidth', '%K', '%D', 'ATR', 'OBV', 'SP500_Close', 'RelPerf'
-            ]
-            
-            # Ensure feature_names length matches feature_data columns
-            if len(feature_data.shape) > 1:
-                num_features = min(len(feature_names), feature_data.shape[1])
-                for i in range(num_features):
-                    df[feature_names[i]] = feature_data[:, i]
+
+        # Clean up and compute technical indicators
+        price_df = price_df.dropna()
+        df = self.stock_predictor.add_technical_indicators(price_df)
+
+        # Add S&P 500 comparison features
+        sp500_data = yf.download('^GSPC', start=start_date, end=end_date, progress=False)
+        if not sp500_data.empty:
+            common_dates = df.index.intersection(sp500_data.index)
+            df.loc[common_dates, 'SP500_Close'] = sp500_data.loc[common_dates, 'Close']
+
+            first_valid_idx = df['SP500_Close'].first_valid_index()
+            if first_valid_idx:
+                stock_start = df.loc[first_valid_idx, 'Close']
+                sp_start = df.loc[first_valid_idx, 'SP500_Close']
+                if stock_start > 0 and sp_start > 0:
+                    df['RelPerf'] = (df['Close'] / stock_start) / (df['SP500_Close'] / sp_start)
+                else:
+                    df['RelPerf'] = 1.0
             else:
-                # Single feature column
-                df['feature_0'] = feature_data
+                df['RelPerf'] = 1.0
+        else:
+            df['SP500_Close'] = 0
+            df['RelPerf'] = 1.0
+
+        df = df.fillna(0)
         
         # Calculate daily returns (percentage change)
         df['daily_return'] = df['Close'].pct_change() * 100

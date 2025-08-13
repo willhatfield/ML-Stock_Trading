@@ -7,17 +7,33 @@ import yfinance as yf
 import joblib
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model #type: ignore
-from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional #type: ignore  
-from tensorflow.keras.layers import Conv1D, MaxPooling1D, BatchNormalization #type: ignore
-from tensorflow.keras.layers import Input, concatenate #type: ignore
-from tensorflow.keras.optimizers import Adam #type: ignore
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau #type: ignore
-from sklearn.model_selection import TimeSeriesSplit, train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import ta
+try:
+    from sklearn.preprocessing import MinMaxScaler, StandardScaler
+    from sklearn.model_selection import TimeSeriesSplit, train_test_split
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+except ImportError:  # pragma: no cover
+    MinMaxScaler = StandardScaler = TimeSeriesSplit = train_test_split = None
+    mean_squared_error = mean_absolute_error = r2_score = None
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, Model, load_model  # type: ignore
+    from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional  # type: ignore
+    from tensorflow.keras.layers import Conv1D, MaxPooling1D, BatchNormalization  # type: ignore
+    from tensorflow.keras.layers import Input, concatenate  # type: ignore
+    from tensorflow.keras.optimizers import Adam  # type: ignore
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau  # type: ignore
+except ImportError:  # pragma: no cover
+    tf = None
+    Sequential = Model = load_model = None
+    Dense = LSTM = Dropout = GRU = Bidirectional = None
+    Conv1D = MaxPooling1D = BatchNormalization = None
+    Input = concatenate = None
+    Adam = None
+    EarlyStopping = ModelCheckpoint = ReduceLROnPlateau = None
+try:
+    import ta
+except ImportError:  # pragma: no cover
+    ta = None
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -59,8 +75,8 @@ class StockPredictor:
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         
         # Initialize scalers with improved parameters
-        self.scaler_price = MinMaxScaler(feature_range=(0, 1))
-        self.scaler_features = StandardScaler()  # Z-score normalization for features
+        self.scaler_price = MinMaxScaler(feature_range=(0, 1)) if MinMaxScaler else None
+        self.scaler_features = StandardScaler() if StandardScaler else None  # Z-score normalization for features
         
         logger.info(f"Initialized StockPredictor with {self.model_type} model type, {self.prediction_days} prediction days")
         
