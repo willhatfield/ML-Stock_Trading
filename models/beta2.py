@@ -3,21 +3,54 @@ import sys
 import logging
 import numpy as np
 import pandas as pd
-import yfinance as yf
-import joblib
-import matplotlib.pyplot as plt
+try:  # pragma: no cover - yfinance is optional for tests
+    import yfinance as yf
+except ModuleNotFoundError:  # pragma: no cover
+    yf = None
+try:  # pragma: no cover
+    import joblib
+except ModuleNotFoundError:  # pragma: no cover
+    joblib = None
+try:  # pragma: no cover
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover
+    plt = None
 from datetime import datetime, timedelta
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model #type: ignore
-from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional #type: ignore  
-from tensorflow.keras.layers import Conv1D, MaxPooling1D, BatchNormalization #type: ignore
-from tensorflow.keras.layers import Input, concatenate #type: ignore
-from tensorflow.keras.optimizers import Adam #type: ignore
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau #type: ignore
-from sklearn.model_selection import TimeSeriesSplit, train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import ta
+try:  # pragma: no cover - optional for tests
+    from sklearn.preprocessing import MinMaxScaler, StandardScaler
+except ModuleNotFoundError:  # pragma: no cover
+    MinMaxScaler = StandardScaler = None
+# Optional TensorFlow imports. These are only required for model training
+# and prediction. Wrapping them in a try/except allows data-related
+# functionality (used in tests) to run in environments where TensorFlow
+# isn't installed.
+try:  # pragma: no cover - TensorFlow is heavy and not needed for tests
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, Model, load_model  # type: ignore
+    from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional  # type: ignore
+    from tensorflow.keras.layers import Conv1D, MaxPooling1D, BatchNormalization  # type: ignore
+    from tensorflow.keras.layers import Input, concatenate  # type: ignore
+    from tensorflow.keras.optimizers import Adam  # type: ignore
+    from tensorflow.keras.callbacks import (
+        EarlyStopping,
+        ModelCheckpoint,
+        ReduceLROnPlateau,
+    )  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    tf = None
+    Sequential = Model = load_model = Dense = LSTM = Dropout = GRU = Bidirectional = None
+    Conv1D = MaxPooling1D = BatchNormalization = Input = concatenate = Adam = None
+    EarlyStopping = ModelCheckpoint = ReduceLROnPlateau = None
+try:  # pragma: no cover - optional for tests
+    from sklearn.model_selection import TimeSeriesSplit, train_test_split
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+except ModuleNotFoundError:  # pragma: no cover
+    TimeSeriesSplit = train_test_split = None
+    mean_squared_error = mean_absolute_error = r2_score = None
+try:  # pragma: no cover
+    import ta
+except ModuleNotFoundError:  # pragma: no cover
+    ta = None
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -59,8 +92,8 @@ class StockPredictor:
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         
         # Initialize scalers with improved parameters
-        self.scaler_price = MinMaxScaler(feature_range=(0, 1))
-        self.scaler_features = StandardScaler()  # Z-score normalization for features
+        self.scaler_price = MinMaxScaler(feature_range=(0, 1)) if MinMaxScaler else None
+        self.scaler_features = StandardScaler() if StandardScaler else None  # Z-score normalization for features
         
         logger.info(f"Initialized StockPredictor with {self.model_type} model type, {self.prediction_days} prediction days")
         
@@ -74,7 +107,8 @@ class StockPredictor:
             symbol: Stock symbol for fetching data (required)
             
         Returns:
-            tuple: (price_data, feature_data) arrays for model input
+            DataFrame: Historical OHLCV data with technical indicators and
+            the original DateTimeIndex
         """
         try:
             # Set default dates if not provided
@@ -108,18 +142,18 @@ class StockPredictor:
             # Fetch stock data using yfinance
             try:
                 stock_data = yf.download(symbol_to_use, start=start_str, end=end_str)
-                
+
                 if stock_data.empty or len(stock_data) < 5:
                     logger.error(f"No data found for {symbol_to_use} or insufficient data points")
-                    return np.array([]), np.array([])
-                
+                    return pd.DataFrame()
+
                 # Clean up the data - handle missing values
                 stock_data = stock_data.dropna()
-                
+
                 # If we have very few data points, return error
                 if len(stock_data) < 30:  # Need at least 30 days for meaningful analysis
                     logger.warning(f"Insufficient data points for {symbol_to_use}: {len(stock_data)} days")
-                    return np.array([]), np.array([])
+                    return pd.DataFrame()
                 
                 logger.info(f"Successfully fetched {len(stock_data)} days of data")
                 
@@ -165,37 +199,21 @@ class StockPredictor:
                 
                 # Fill any remaining NaN values with 0
                 indicators_df = indicators_df.fillna(0)
-                
-                # Extract price and feature data
-                price_data = indicators_df['Close'].values
-                
-                # Extract technical indicators (excluding date, open, high, low, close)
-                feature_columns = [
-                    'Volume', 'Returns', 'MA5', 'MA20', 'RSI', 'MACD', 
-                    'BBWidth', '%K', '%D', 'ATR', 'OBV', 'SP500_Close', 'RelPerf'
-                ]
-                
-                # Keep only features that exist in the dataframe
-                available_features = [col for col in feature_columns if col in indicators_df.columns]
-                if available_features:
-                    feature_data = indicators_df[available_features].values
-                else:
-                    logger.warning("No technical features available")
-                    feature_data = np.array([])
-                
-                return price_data, feature_data
+
+                # Return full DataFrame including OHLCV and indicators
+                return indicators_df
                 
             except Exception as e:
                 logger.error(f"Error fetching stock data for {symbol_to_use}: {e}")
                 import traceback
                 traceback.print_exc()
-                return np.array([]), np.array([])
+                return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"Error in fetch_data: {e}")
             import traceback
             traceback.print_exc()
-            return np.array([]), np.array([])
+            return pd.DataFrame()
             
     def add_technical_indicators(self, data):
         """

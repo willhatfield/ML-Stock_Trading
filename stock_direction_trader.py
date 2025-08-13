@@ -1,19 +1,41 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+# Matplotlib is only required for plotting, which the tests do not use.
+try:  # pragma: no cover
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover
+    plt = None
 import argparse
 import logging
 import os
 import sys
 from datetime import datetime, timedelta
-import tensorflow as tf
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import joblib
+# TensorFlow is optional for data preparation tests; import lazily.
+try:  # pragma: no cover - heavy dependency not needed for tests
+    import tensorflow as tf
+except ModuleNotFoundError:  # pragma: no cover
+    tf = None
+try:  # pragma: no cover - optional for tests
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score,
+        confusion_matrix,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    StandardScaler = None
+    accuracy_score = precision_score = recall_score = f1_score = confusion_matrix = None
+try:  # pragma: no cover
+    import joblib
+except ModuleNotFoundError:  # pragma: no cover
+    joblib = None
 
 # Set random seeds for reproducibility
 np.random.seed(42)
-tf.random.set_seed(42)
+if tf is not None:
+    tf.random.set_seed(42)
 
 # Import the StockPredictor from beta2.py for data fetching and indicators
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'))
@@ -55,7 +77,7 @@ class StockDirectionTrader:
         )
         
         # Initialize scalers
-        self.feature_scaler = StandardScaler()
+        self.feature_scaler = StandardScaler() if StandardScaler else None
         
         # Initialize model
         self.model = None
@@ -89,56 +111,18 @@ class StockDirectionTrader:
         Returns:
             DataFrame with price data and features
         """
-        # Fetch historical data
+        # Fetch historical data with true OHLCV from the predictor
         logger.info(f"Fetching data for {self.symbol} from {start_date} to {end_date}")
-        price_data, feature_data = self.stock_predictor.fetch_data(start_date, end_date, self.symbol)
-        
-        if len(price_data) == 0:
+        df = self.stock_predictor.fetch_data(start_date, end_date, self.symbol)
+
+        if df is None or df.empty:
             raise ValueError(f"No data retrieved for {self.symbol}. Check the symbol and date range.")
-        
-        # Handle different shapes of price_data
-        logger.info(f"Price data shape: {price_data.shape}")
-        
-        # Ensure price_data is 1-dimensional
-        if len(price_data.shape) > 1:
-            # If it's a 2D array, assume the first column is the close price
-            price_values = price_data[:, 0] if price_data.shape[1] > 0 else price_data.flatten()
-        else:
-            price_values = price_data
-        
-        # Create a DataFrame with dates as index
-        dates = pd.date_range(start=start_date, periods=len(price_values), freq='B')
-        
-        # Create a DataFrame with the Close prices
-        df = pd.DataFrame({
-            'Close': price_values
-        }, index=dates)
-        
-        # Generate simple OHLC data (approximation since we only have Close)
-        # This is just for features that might expect this format
-        df['Open'] = df['Close'].values
-        df['High'] = df['Close'].values
-        df['Low'] = df['Close'].values
-        df['Volume'] = 0  # Placeholder
-        
-        # Add technical indicators from feature_data
-        if feature_data is not None and feature_data.size > 0:
-            logger.info(f"Feature data shape: {feature_data.shape}")
-            
-            # Get feature names based on beta2.py structure
-            feature_names = [
-                'Volume', 'Returns', 'MA5', 'MA20', 'RSI', 'MACD', 
-                'BBWidth', '%K', '%D', 'ATR', 'OBV', 'SP500_Close', 'RelPerf'
-            ]
-            
-            # Ensure feature_names length matches feature_data columns
-            if len(feature_data.shape) > 1:
-                num_features = min(len(feature_names), feature_data.shape[1])
-                for i in range(num_features):
-                    df[feature_names[i]] = feature_data[:, i]
-            else:
-                # Single feature column
-                df['feature_0'] = feature_data
+
+        # Ensure we have the core OHLCV columns
+        required_cols = {'Open', 'High', 'Low', 'Close', 'Volume'}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
         
         # Calculate daily returns (percentage change)
         df['daily_return'] = df['Close'].pct_change() * 100
@@ -146,12 +130,14 @@ class StockDirectionTrader:
         # Create target variable: 1 if price goes up tomorrow, 0 if down
         df['target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
         
-        # Drop NaN values
+        # Drop NaN values introduced by calculations
         df.dropna(inplace=True)
-        
+
         # Ensure we have enough data points
         if len(df) < self.lookback_days * 2:
-            raise ValueError(f"Not enough data points after processing: {len(df)}. Need at least {self.lookback_days * 2}.")
+            raise ValueError(
+                f"Not enough data points after processing: {len(df)}. Need at least {self.lookback_days * 2}."
+            )
         
         logger.info(f"Prepared data with {len(df)} days and {len(df.columns)} features")
         
