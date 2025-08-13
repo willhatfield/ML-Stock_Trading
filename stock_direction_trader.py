@@ -275,28 +275,18 @@ class StockDirectionTrader:
         if len(features.shape) == 2:
             features = np.expand_dims(features, axis=0)
         
-        # Get prediction probability
+        # Get prediction probability and use it directly without random noise
         pred_prob = self.model.predict(features, verbose=0)
-        raw_confidence = pred_prob[0][0]
-        
-        # Add randomness to predictions to avoid always predicting the same direction
-        # Use a lower threshold for UP predictions to encourage more diversity
-        # This is a form of exploration in reinforcement learning
-        
-        # Add noise to the prediction probability
-        noise_factor = 0.05  # 5% noise
-        noisy_confidence = raw_confidence + np.random.uniform(-noise_factor, noise_factor)
-        
-        # Ensure it's still a valid probability
-        noisy_confidence = max(0.01, min(0.99, noisy_confidence))
-        
-        # Use a threshold of 0.48 to encourage more DOWN predictions
-        prediction = 1 if noisy_confidence > 0.51 else 0
-        
-        # Log the original and adjusted confidence
-        logger.debug(f"Raw confidence: {raw_confidence:.4f}, Noisy confidence: {noisy_confidence:.4f}, Prediction: {prediction}")
-        
-        return prediction, noisy_confidence
+        confidence = float(pred_prob[0][0])
+
+        # Determine signal based on raw model confidence
+        signal = int(confidence > 0.5)
+
+        logger.debug(
+            f"Confidence: {confidence:.4f}, Prediction: {signal}"
+        )
+
+        return signal, confidence
 
     def generate_signal(self, prediction, confidence, current_position):
         """
