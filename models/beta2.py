@@ -311,10 +311,10 @@ class StockPredictor:
                 logger.warning(f"Error calculating OBV: {e}")
                 df['OBV'] = df['Volume'].cumsum()  # Default cumulative volume
             
-            # Fill NaN values with appropriate methods
+            # Fill NaN values with appropriate methods (no backward fill to avoid look-ahead)
             for col in df.columns:
                 if col not in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    df[col] = df[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
+                    df[col] = df[col].fillna(method='ffill').fillna(0)
             
             return df
             
@@ -345,9 +345,11 @@ class StockPredictor:
                 logger.warning(f"Not enough price data for model training. Need at least {self.prediction_days} points.")
                 return None, None, None
             
-            # Scale the price data
+            # Scale the price data (fit on first 80% to avoid leakage, then transform all)
             price_data_2d = price_data.reshape(-1, 1)
-            scaled_prices = self.scaler_price.fit_transform(price_data_2d).flatten()
+            split_idx = max(1, int(len(price_data_2d) * 0.8))
+            self.scaler_price.fit(price_data_2d[:split_idx])
+            scaled_prices = self.scaler_price.transform(price_data_2d).flatten()
             
             # Create sequences for price data
             x_price = []
@@ -552,6 +554,7 @@ class StockPredictor:
                     validation_split=validation_split,
                     callbacks=callbacks,
                     sample_weight=sample_weights,
+                    shuffle=False,
                     verbose=1
                 )
             else:
@@ -562,6 +565,7 @@ class StockPredictor:
                     validation_split=validation_split,
                     callbacks=callbacks,
                     sample_weight=sample_weights,
+                    shuffle=False,
                     verbose=1
                 )
             
