@@ -1,0 +1,30 @@
+{
+  "strategy": "momentum",
+  "symbol": "SPY",
+  "start_date": "2018-01-01",
+  "end_date": "2023-01-01",
+  "walk_forward": {
+    "train_years": 2,
+    "val_months": 3,
+    "test_months": 3,
+    "step_months": 3,
+    "embargo_days": 5,
+    "initial_capital": 100000.0,
+    "cost_bps": 30.0,
+    "risk_free_rate": 0.04,
+    "min_train_days": 252,
+    "min_val_days": 63,
+    "min_test_days": 63,
+    "min_folds": 4,
+    "cost_sensitivity_bps": [
+      5.0,
+      30.0,
+      100.0
+    ],
+    "enable_cost_sensitivity": true,
+    "enable_robustness": true,
+    "enable_parameter_sensitivity": true,
+    "parameter_sensitivity_pct": 0.2,
+    "regime_ma_window": 200
+  }
+}
