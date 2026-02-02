@@ -26,7 +26,7 @@ sys.modules.setdefault('beta2', types.SimpleNamespace(StockPredictor=_StockPredi
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from stock_direction_trader import StockDirectionTrader
+from tests.stock_direction_trader import StockDirectionTrader
 
 
 def test_fee_deduction():

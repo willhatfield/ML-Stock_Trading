@@ -1,5 +1,5 @@
 import numpy as np
-from stock_direction_trader import StockDirectionTrader
+from tests.stock_direction_trader import StockDirectionTrader
 
 
 class DummyModel:

@@ -1,7 +1,7 @@
 import types
 import numpy as np
 import tensorflow as tf
-from stock_direction_trader import StockDirectionTrader
+from tests.stock_direction_trader import StockDirectionTrader
 
 
 def test_training_no_shuffle_and_chronological_split(monkeypatch):
